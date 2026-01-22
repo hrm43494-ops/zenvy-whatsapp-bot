@@ -1,3 +1,4 @@
+powershell -Command @'
 from flask import Flask, request
 import requests, os, sys
 from dotenv import load_dotenv
@@ -26,7 +27,7 @@ def log(msg):
 
 # ================= ENV CHECK =================
 if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-    log("❌ ENV ERROR: WhatsApp config missing")
+    log("❌ ENV ERROR: WhatsApp token / phone missing")
     sys.exit(1)
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -38,19 +39,15 @@ CREDS = Credentials.from_service_account_file("google_key.json", scopes=SCOPES)
 GS = gspread.authorize(CREDS)
 
 SPREADSHEET_ID = "1JOsJqxy_wfD6vNlWhJlzPD3fSsVoohQtD_4YbAXOFwk"
-
-LEADS = GS.open_by_key(SPREADSHEET_ID).worksheet("LEADS")
-SESSIONS = GS.open_by_key(SPREADSHEET_ID).worksheet("sessions")
+SHEET = GS.open_by_key(SPREADSHEET_ID)
+LEADS = SHEET.sheet1
+SESSIONS = SHEET.worksheet("sessions")
 
 log("✅ Google Sheets connected")
 
-# ================= HELPERS =================
-def generate_invoice_id():
-    return "INV-" + datetime.now().strftime("%m%d%H%M")
-
+# ================= SESSION HELPERS =================
 def get_session(phone):
-    rows = SESSIONS.get_all_records()
-    for r in rows:
+    for r in SESSIONS.get_all_records():
         if str(r["phone"]) == str(phone):
             return r
     return None
@@ -59,20 +56,11 @@ def save_session(phone, stage, website_type="", pages="", budget="", price=""):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row = get_session(phone)
 
-    data = [
-        phone,
-        stage,
-        website_type,
-        pages,
-        budget,
-        price,
-        now,
-        now
-    ]
+    data = [phone, stage, website_type, pages, budget, price, now]
 
     if row:
         cell = SESSIONS.find(str(phone))
-        SESSIONS.update(f"A{cell.row}:H{cell.row}", [data])
+        SESSIONS.update(f"A{cell.row}:G{cell.row}", [data])
     else:
         SESSIONS.append_row(data)
 
@@ -85,11 +73,12 @@ def clear_session(phone):
 
 # ================= PRICE LOGIC =================
 def calculate_price(site_type, pages_text):
-    pages = len([p for p in pages_text.split(",") if p.strip()])
+    pages = len(pages_text.split(","))
+    site_type = site_type.lower()
 
     if "business" in site_type:
         return 7000 if pages <= 5 else 10000
-    if "e-commerce" in site_type or "ecommerce" in site_type:
+    if "ecommerce" in site_type:
         return 15000 if pages <= 5 else 25000
     if "portfolio" in site_type:
         return 5000
@@ -108,17 +97,16 @@ Ask only ONE question.
 User message: {text}
 """
     try:
-        res = client.chat.completions.create(
+        r = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=120
         )
-        return res.choices[0].message.content.strip()
-    except Exception as e:
-        log(f"❌ AI ERROR: {e}")
+        return r.choices[0].message.content.strip()
+    except:
         return "Type *website* to continue 🙂"
 
-# ================= WHATSAPP SEND =================
+# ================= SEND WHATSAPP =================
 def send_whatsapp(to, text):
     url = f"https://graph.facebook.com/v22.0/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -131,8 +119,7 @@ def send_whatsapp(to, text):
         "type": "text",
         "text": {"body": text}
     }
-    r = requests.post(url, headers=headers, json=payload)
-    log(f"📤 SEND {r.status_code}")
+    requests.post(url, headers=headers, json=payload)
 
 def notify_admin(msg):
     if ADMIN_PHONE:
@@ -154,24 +141,17 @@ def webhook():
         return "OK", 200
 
     msg = value["messages"][0]
-    user = msg["from"]
-
-    # 🔥 PAYMENT SCREENSHOT
-    if msg.get("type") == "image":
-        notify_admin(f"📸 PAYMENT SCREENSHOT RECEIVED\nPhone: {user}")
-        send_whatsapp(user, "📸 Screenshot received! Verification in progress.")
-        return "OK", 200
-
     if msg.get("type") != "text":
         return "OK", 200
 
+    user = msg["from"]
     text = msg["text"]["body"].strip().lower()
+
     session = get_session(user)
     stage = session["stage"] if session else "start"
 
     log(f"{user} | {text} | stage={stage}")
 
-    # ================= FLOW =================
     if text in ["hi", "hello"]:
         save_session(user, "start")
         reply = "👋 Hi! Welcome to *Zenvy Services*\nType *website* to continue."
@@ -192,30 +172,23 @@ def webhook():
         price = calculate_price(session["website_type"], session["pages"])
         save_session(user, "payment", session["website_type"], session["pages"], text, price)
 
-        notify_admin(
-            f"🆕 NEW LEAD\nPhone: {user}\nType: {session['website_type']}\nPages: {session['pages']}\nBudget: {text}\nPrice: ₹{price}"
-        )
+        notify_admin(f"🆕 NEW LEAD\nPhone: {user}\nPrice: ₹{price}")
 
         reply = (
-            f"💻 *Website Quotation*\n\n"
+            f"💻 *Quotation*\n"
             f"Type: {session['website_type']}\n"
             f"Pages: {session['pages']}\n"
             f"💰 Price: ₹{price}\n\n"
-            "1️⃣ Pay via UPI\n"
-            "2️⃣ Talk to executive"
+            "1️⃣ Pay via UPI\n2️⃣ Talk to human"
         )
 
     elif stage == "payment":
-        if "1" in text or "upi" in text:
-            reply = "📲 Pay via UPI: yourupi@bank\nPayment ke baad *PAID* likhein."
-
-        elif "2" in text or "call" in text:
-            notify_admin(f"📞 CALL REQUEST\nPhone: {user}")
-            reply = "📞 Our executive will contact you shortly."
-
+        if "1" in text:
+            reply = "📲 UPI: yourupi@bank\nPayment ke baad *PAID* likhein."
+        elif "2" in text:
+            notify_admin(f"📞 CALL REQUEST: {user}")
+            reply = "📞 Executive will call you shortly."
         elif "paid" in text:
-            invoice = generate_invoice_id()
-
             LEADS.append_row([
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 user,
@@ -223,17 +196,12 @@ def webhook():
                 session["pages"],
                 session["budget"],
                 session["price"],
-                invoice,
-                "PAID_PENDING",
-                ""
+                "PAID"
             ])
-
-            notify_admin(f"✅ PAYMENT MARKED PAID\nPhone: {user}\nInvoice: {invoice}")
             clear_session(user)
-            reply = "🎉 Payment received! Verification in progress."
-
+            reply = "🎉 Payment received! Thank you."
         else:
-            reply = "Please reply 1️⃣ or 2️⃣"
+            reply = "Reply 1️⃣ or 2️⃣"
 
     else:
         reply = ai_reply(text)
@@ -243,6 +211,7 @@ def webhook():
 
 # ================= RUN =================
 if __name__ == "__main__":
-    log("🚀 BOT STARTED – FINAL POWER VERSION")
+    log("🚀 BOT STARTED – RAILWAY READY")
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+'@ | Out-File -Encoding utf8 app.py
