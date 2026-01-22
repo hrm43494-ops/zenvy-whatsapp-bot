@@ -1,8 +1,7 @@
-powershell -Command @'
 from flask import Flask, request
 import requests, os, sys
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
@@ -27,7 +26,7 @@ def log(msg):
 
 # ================= ENV CHECK =================
 if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-    log("❌ ENV ERROR: WhatsApp token / phone missing")
+    log("❌ ENV ERROR: WhatsApp config missing")
     sys.exit(1)
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -40,12 +39,32 @@ GS = gspread.authorize(CREDS)
 
 SPREADSHEET_ID = "1JOsJqxy_wfD6vNlWhJlzPD3fSsVoohQtD_4YbAXOFwk"
 SHEET = GS.open_by_key(SPREADSHEET_ID)
-LEADS = SHEET.sheet1
-SESSIONS = SHEET.worksheet("sessions")
 
-log("✅ Google Sheets connected")
+# 🔥 AUTO CREATE SHEETS (NO CRASH)
+def get_or_create(title, headers):
+    try:
+        ws = SHEET.worksheet(title)
+    except:
+        ws = SHEET.add_worksheet(title=title, rows=1000, cols=len(headers))
+        ws.append_row(headers)
+    return ws
 
-# ================= SESSION HELPERS =================
+LEADS = get_or_create(
+    "LEADS",
+    ["time", "phone", "website_type", "pages", "budget", "price", "invoice", "status", "note"]
+)
+
+SESSIONS = get_or_create(
+    "sessions",
+    ["phone", "stage", "website_type", "pages", "budget", "price", "updated_at"]
+)
+
+log("✅ Google Sheets ready")
+
+# ================= HELPERS =================
+def generate_invoice_id():
+    return "INV-" + datetime.now().strftime("%m%d%H%M")
+
 def get_session(phone):
     for r in SESSIONS.get_all_records():
         if str(r["phone"]) == str(phone):
@@ -73,7 +92,7 @@ def clear_session(phone):
 
 # ================= PRICE LOGIC =================
 def calculate_price(site_type, pages_text):
-    pages = len(pages_text.split(","))
+    pages = len([p for p in pages_text.split(",") if p.strip()])
     site_type = site_type.lower()
 
     if "business" in site_type:
@@ -89,24 +108,21 @@ def ai_reply(text):
     if not client:
         return "Type *website* to continue 🙂"
 
-    prompt = f"""
-You are a WhatsApp sales assistant.
-Tone: Hinglish, friendly, short.
-Ask only ONE question.
-
-User message: {text}
-"""
     try:
         r = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{
+                "role": "user",
+                "content": f"Hinglish sales assistant. Ask ONE short question.\nUser: {text}"
+            }],
             max_tokens=120
         )
         return r.choices[0].message.content.strip()
-    except:
+    except Exception as e:
+        log(f"AI ERROR: {e}")
         return "Type *website* to continue 🙂"
 
-# ================= SEND WHATSAPP =================
+# ================= WHATSAPP =================
 def send_whatsapp(to, text):
     url = f"https://graph.facebook.com/v22.0/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -134,24 +150,34 @@ def webhook():
             return request.args.get("hub.challenge")
         return "Invalid", 403
 
-    data = request.json
-    value = data["entry"][0]["changes"][0]["value"]
+    data = request.json or {}
+    try:
+        value = data["entry"][0]["changes"][0]["value"]
+    except:
+        return "OK", 200
 
     if "messages" not in value:
         return "OK", 200
 
     msg = value["messages"][0]
+    user = msg["from"]
+
+    # 📸 IMAGE
+    if msg.get("type") == "image":
+        notify_admin(f"📸 PAYMENT SCREENSHOT\nPhone: {user}")
+        send_whatsapp(user, "📸 Screenshot received! Verification in progress.")
+        return "OK", 200
+
     if msg.get("type") != "text":
         return "OK", 200
 
-    user = msg["from"]
     text = msg["text"]["body"].strip().lower()
-
     session = get_session(user)
     stage = session["stage"] if session else "start"
 
-    log(f"{user} | {text} | stage={stage}")
+    log(f"{user} | {text} | {stage}")
 
+    # ================= FLOW =================
     if text in ["hi", "hello"]:
         save_session(user, "start")
         reply = "👋 Hi! Welcome to *Zenvy Services*\nType *website* to continue."
@@ -162,17 +188,17 @@ def webhook():
 
     elif stage == "type":
         save_session(user, "pages", website_type=text)
-        reply = "📄 Pages needed? (Home, About, Contact)"
+        reply = "📄 Pages? (Home, About, Contact)"
 
     elif stage == "pages":
         save_session(user, "budget", session["website_type"], pages=text)
-        reply = "💰 Budget range?\n• 5-10\n• 10-20\n• 20+"
+        reply = "💰 Budget?\n• 5-10\n• 10-20\n• 20+"
 
     elif stage == "budget":
         price = calculate_price(session["website_type"], session["pages"])
         save_session(user, "payment", session["website_type"], session["pages"], text, price)
 
-        notify_admin(f"🆕 NEW LEAD\nPhone: {user}\nPrice: ₹{price}")
+        notify_admin(f"🆕 LEAD {user} ₹{price}")
 
         reply = (
             f"💻 *Quotation*\n"
@@ -186,9 +212,10 @@ def webhook():
         if "1" in text:
             reply = "📲 UPI: yourupi@bank\nPayment ke baad *PAID* likhein."
         elif "2" in text:
-            notify_admin(f"📞 CALL REQUEST: {user}")
+            notify_admin(f"📞 CALL REQUEST {user}")
             reply = "📞 Executive will call you shortly."
         elif "paid" in text:
+            invoice = generate_invoice_id()
             LEADS.append_row([
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 user,
@@ -196,10 +223,13 @@ def webhook():
                 session["pages"],
                 session["budget"],
                 session["price"],
-                "PAID"
+                invoice,
+                "PAID_PENDING",
+                ""
             ])
             clear_session(user)
-            reply = "🎉 Payment received! Thank you."
+            notify_admin(f"✅ PAID {user} {invoice}")
+            reply = "🎉 Payment received! Verification in progress."
         else:
             reply = "Reply 1️⃣ or 2️⃣"
 
@@ -211,7 +241,6 @@ def webhook():
 
 # ================= RUN =================
 if __name__ == "__main__":
-    log("🚀 BOT STARTED – RAILWAY READY")
+    log("🚀 BOT STARTED – STABLE PRODUCTION")
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-'@ | Out-File -Encoding utf8 app.py
