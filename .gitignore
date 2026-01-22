@@ -1,0 +1,5 @@
+.env 
+google_key.json 
+bot.log 
+__pycache__/ 
+venv/ 
