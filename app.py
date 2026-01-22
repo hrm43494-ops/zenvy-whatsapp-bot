@@ -1,5 +1,5 @@
 from flask import Flask, request
-import requests, os, sys
+import requests, os, sys, json
 from dotenv import load_dotenv
 from datetime import datetime
 import gspread
@@ -10,11 +10,12 @@ from openai import OpenAI
 load_dotenv()
 app = Flask(__name__)
 
-VERIFY_TOKEN = "mytoken123"
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "mytoken123")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_PHONE = os.getenv("ADMIN_PHONE")
+GOOGLE_KEY_JSON = os.getenv("GOOGLE_KEY_JSON")
 
 LOG_FILE = "bot.log"
 
@@ -25,22 +26,32 @@ def log(msg):
         f.write(line + "\n")
 
 # ================= ENV CHECK =================
-if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-    log("❌ ENV ERROR: WhatsApp config missing")
+missing = []
+if not WHATSAPP_TOKEN: missing.append("WHATSAPP_TOKEN")
+if not PHONE_NUMBER_ID: missing.append("PHONE_NUMBER_ID")
+if not GOOGLE_KEY_JSON: missing.append("GOOGLE_KEY_JSON")
+
+if missing:
+    log(f"❌ ENV MISSING: {', '.join(missing)}")
     sys.exit(1)
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 log("✅ ENV loaded")
 
-# ================= GOOGLE SHEETS =================
+# ================= GOOGLE SHEETS (ENV SAFE) =================
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-CREDS = Credentials.from_service_account_file("google_key.json", scopes=SCOPES)
-GS = gspread.authorize(CREDS)
+
+try:
+    key_dict = json.loads(GOOGLE_KEY_JSON)
+    CREDS = Credentials.from_service_account_info(key_dict, scopes=SCOPES)
+    GS = gspread.authorize(CREDS)
+except Exception as e:
+    log(f"❌ GOOGLE AUTH ERROR: {e}")
+    sys.exit(1)
 
 SPREADSHEET_ID = "1JOsJqxy_wfD6vNlWhJlzPD3fSsVoohQtD_4YbAXOFwk"
 SHEET = GS.open_by_key(SPREADSHEET_ID)
 
-# 🔥 AUTO CREATE SHEETS (NO CRASH)
 def get_or_create(title, headers):
     try:
         ws = SHEET.worksheet(title)
@@ -67,15 +78,14 @@ def generate_invoice_id():
 
 def get_session(phone):
     for r in SESSIONS.get_all_records():
-        if str(r["phone"]) == str(phone):
+        if str(r.get("phone")) == str(phone):
             return r
     return None
 
 def save_session(phone, stage, website_type="", pages="", budget="", price=""):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    row = get_session(phone)
-
     data = [phone, stage, website_type, pages, budget, price, now]
+    row = get_session(phone)
 
     if row:
         cell = SESSIONS.find(str(phone))
@@ -107,7 +117,6 @@ def calculate_price(site_type, pages_text):
 def ai_reply(text):
     if not client:
         return "Type *website* to continue 🙂"
-
     try:
         r = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -160,9 +169,8 @@ def webhook():
         return "OK", 200
 
     msg = value["messages"][0]
-    user = msg["from"]
+    user = msg.get("from")
 
-    # 📸 IMAGE
     if msg.get("type") == "image":
         notify_admin(f"📸 PAYMENT SCREENSHOT\nPhone: {user}")
         send_whatsapp(user, "📸 Screenshot received! Verification in progress.")
@@ -177,7 +185,6 @@ def webhook():
 
     log(f"{user} | {text} | {stage}")
 
-    # ================= FLOW =================
     if text in ["hi", "hello"]:
         save_session(user, "start")
         reply = "👋 Hi! Welcome to *Zenvy Services*\nType *website* to continue."
