@@ -1,6 +1,6 @@
-flask
-requests
-python-dotenv
-gspread
-google-auth
-openai
+flask==3.0.0 
+requests 
+python-dotenv 
+gspread 
+google-auth 
+openai 
